@@ -1,5 +1,5 @@
 
-# Profil Ceramide Data Analysis:
+# Profil Ceramides:
 
 This project set out to investigate the ceramides Cer(16:0), Cer(18:0), Cer(20:0), Cer(22:0) Cer(24:0), Cer(24:1)
 for their association to cardiovascular dissease in the Profil trial. 
