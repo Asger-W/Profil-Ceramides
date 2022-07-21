@@ -1,0 +1,1213 @@
+---
+title: "Profil_4cer_Statistical_analysis"
+author: "Asger_Wretlind"
+date: "15/2/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#Packages
+library(here)
+library(tidyverse)
+library(vroom)
+library(tableone)
+library(survival)
+library(survminer)
+
+#Color palette based on Wassily Kandinsky´s On White II
+Kandinsky_OW2 <- c(Red    = "#8C2336", 
+                   Blue   = "#5888A6", 
+                   Yellow = "#D9B54A", 
+                   White  = "#F2EFE9", 
+                   Brown  = "#A6763C")
+
+```
+
+```{r Import Processed Data}
+#Import and set cv death and cv complications to factors
+data <- vroom::vroom(here::here("data/0033_profil_4cer_data_preprocessed.csv"))
+
+#Convert factors
+data <- data %>%
+  mutate(across(which(
+    apply(., 2, function(x) {
+    tmp <- unique(x)
+    length(tmp) - sum(is.na(tmp)) == 2L})),
+  ~ factor(.))) %>%
+  mutate_at(c("Sample_ID", "Albuminuri_3_groups", "Retinopathy"), ~ factor(.))
+
+#Split curated (Complete data with 662 observations) and 
+#full data set (721 observations but many missing values)
+data_full <- data
+data_curated <- data %>%
+  filter(Curated == 1)
+
+#Scaled ceramides
+data_scale <- data_curated %>% 
+    mutate(across(starts_with("Target")|starts_with("Ratio"), ~scale(.)))
+
+#Go with curated 
+data <- data_curated
+
+```
+
+```{r Clinical Characteristics Table}
+#Vector of all variables between "Age" and "Spiron" used for clinical characteristics table
+CCtable_vars <- colnames(data)[which(colnames(data) == "Age"):
+                                which(colnames(data) == "Spiron")]
+
+
+
+#Clinical characteristics table, stratified by previous CV complications
+CCtable <- data %>%
+  mutate(Gender = factor(Gender,levels = c(1, 0), labels = c("Man", "Woman"))) %>%
+  mutate(RAAS = factor(RAAS,levels = c(2, 1))) %>%
+  mutate(across(starts_with("Cer_"), ~.*1000)) %>%
+        CreateTableOne(vars = CCtable_vars,
+                                strata = "cv_komb_profil",
+                                #strata = "ESRD_profil", 
+                                #strata = "doed_profil",
+                                addOverall = TRUE)
+
+CCtable
+#write.csv(print(CCtable, printToggle = FALSE), here("data/CCtable.csv"))
+
+#Median days followed
+data %>%
+  mutate(followed = pro_date_end - pro_date_index) %>%
+  summarise(
+    Median = median(followed),
+    IQR = IQR(followed),
+    Median_year = (median(followed)) / 365,
+    IQR_year = (IQR(followed)) / 365)
+
+
+rm(CCtable, CCtable_vars)
+```
+
+```{r Ceramide Table}
+#Note: measures are changed from ug/mol to ng/mol
+#Table of mean, startified by CVE
+CerTable_CVE <- data %>%
+    select(c(starts_with("Target"), starts_with("Ratio"), cv_komb_profil)) %>% 
+    mutate(across(starts_with("Target"), ~.*1000)) %>% 
+    rename_with( ~gsub("Target_", "Cer", .)) %>%
+    rename_with( ~gsub("Ratio ", "Ratio Cer", .)) %>%
+    rename_with( ~gsub("24_", "24:", .)) %>%
+    rename_with( ~gsub("/24", "/Cer24", .)) %>%
+        CreateTableOne(data = .,
+                       strata = "cv_komb_profil",
+                                #strata = "ESRD_profil", 
+                                #strata = "doed_profil",
+                                addOverall = TRUE)
+
+#Table of quartiles 
+CerTable_quartiles <- data %>%
+    select(c(starts_with("Target"), starts_with("Ratio"))) %>% 
+    mutate(across(starts_with("Target"), ~.*1000)) %>% 
+    rename_with( ~gsub("Target_", "Cer", .)) %>%
+    rename_with( ~gsub("Ratio ", "Ratio Cer", .)) %>%
+    rename_with( ~gsub("24_", "24:", .)) %>%
+    rename_with( ~gsub("/24", "/Cer24", .)) %>% 
+    summarise(across(everything(),  ~quantile(.))) %>% 
+    t() %>% 
+    round(., digits = 2) %>% 
+    as.data.frame()
+
+colnames(CerTable_quartiles) <- c("Min", "Q1", "Median", "Q3", "Max")
+    
+CerTable_CVE
+CerTable_quartiles
+
+# write.csv(print(CerTable_CVE, printToggle = FALSE), here("data/CerTable_CVE.csv"))
+# write.csv(print(CerTable_quartiles, printToggle = FALSE), here("data/CerTable_quartiles.csv"))
+
+rm(CerTable_CVE, CerTable_quartiles)
+
+```
+
+```{r Extraction function for Cox regression}
+#Function for extracting Coefficient, upper and lower confidence interval and p-value
+Cox_extract <- function(Data, Formula){
+  
+  #Extract explanatory variable
+  expl_var <- word(as.character(c(Formula)), 3) 
+      #strsplit(as.character(Formula)[3], split = " ")[[1]][1]
+
+  #Fit Cox regression model
+  tmp_cox <- coxph(formula = as.formula(Formula), data = Data)
+  
+  #Summary object
+  tmp_cox_sum <- summary(tmp_cox)
+  
+  #Vector to output
+  out_df <- data.frame(expl_var = word(as.character(c(Formula)), 3),
+               coeff = tmp_cox_sum$conf.int[expl_var, "exp(coef)"],
+               conf_low = tmp_cox_sum$conf.int[expl_var, "lower .95"], 
+               conf_up = tmp_cox_sum$conf.int[expl_var, "upper .95"], 
+               pval = tmp_cox_sum$coefficients[expl_var, "Pr(>|z|)"])
+  
+  return(out_df)
+  
+}
+```
+
+```{r Cox regression cardiovascular events with adjustments}
+#Survival object
+surv_object <- Surv(data_scale$t_cv_komb_profil, as.numeric(as.character(data_scale$cv_komb_profil)))
+
+## 1) CVE - Crude model
+#Use Cox_extract function across data that starts with Target or Ratio, pivot into a table
+Cox_overview_1 <- data_scale %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(Data = data_scale, Formula = surv_object ~ .))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>% 
+    mutate("model" = "Crude")
+
+Cox_overview_1
+
+## 2) CVE - Adjusted model
+Cox_overview_2 <- data_scale %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(data_scale, Formula = surv_object ~ .
+                      + Age 
+                      + BMI 
+                      + Blood_LDL 
+                      + Blood_TGA 
+                      + CALSBP 
+                      + Gender 
+                      + GFRepi 
+                      + HbA1C_mmol_mol 
+                      + logUAER 
+                      + Previous_CVD 
+                      + Smoking 
+                      + Statin))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>%
+    mutate("model" = "Adjusted")
+
+Cox_overview_2
+
+
+## 3) CVE - Adjusted light model
+Cox_overview_3 <- data_scale %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(data_scale, Formula = surv_object ~ .
+                      + Age 
+                      + BMI 
+                      + Blood_LDL 
+                      + Blood_TGA 
+                      + CALSBP 
+                      + Gender 
+                      + HbA1C_mmol_mol 
+                      + Previous_CVD 
+                      + Smoking 
+                      + Statin))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr"))%>% 
+    mutate("model" = "Adj. light")
+
+Cox_overview_3
+
+#Combine the 3 CVE models into a single table
+Cox_overview_CVE <- Cox_overview_1 %>% 
+    rbind(., Cox_overview_2, Cox_overview_3) %>% 
+    mutate("outcome" = "CVE")
+
+rm(Cox_overview_1, Cox_overview_2, Cox_overview_3, surv_object)
+```
+
+```{r Cox regression kidney events with adjustments}
+#Survival object
+surv_object <- Surv(data_scale$t_ESRD_profil, as.numeric(as.character(data_scale$ESRD_profil)))
+# surv_object <- Surv(data_scale$t_komb_nyre_endepunkt_p, as.numeric(as.character(data_scale$komb_nyre_endepunkt_p)))
+
+## 4) ESKD - Crude model
+#Use Cox_extract function across data that starts with Target or Ratio, pivot into a table
+Cox_overview_4 <- data_scale %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(Data = data_scale, Formula = surv_object ~ .))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>%
+    mutate("model" = "Crude")
+
+Cox_overview_4
+
+
+## 5) ESKD - Adjusted model
+Cox_overview_5 <- data_scale %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(data_scale, Formula = surv_object ~ . 
+                      + Age 
+                      + BMI 
+                      + Blood_LDL 
+                      + Blood_TGA 
+                      + CALSBP 
+                      + Gender 
+                      + GFRepi 
+                      + HbA1C_mmol_mol 
+                      + logUAER 
+                      + Previous_CVD 
+                      + Smoking 
+                      + Statin))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>% 
+    mutate("model" = "Adjusted")
+
+Cox_overview_5
+
+
+## 6) ESKD - Adjusted light model
+Cox_overview_6 <- data_scale %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(data_scale, Formula = surv_object ~ . 
+                      + Age 
+                      + BMI 
+                      + Blood_LDL 
+                      + Blood_TGA 
+                      + CALSBP 
+                      + Gender 
+                      + HbA1C_mmol_mol 
+                      + Previous_CVD 
+                      + Smoking 
+                      + Statin))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>% 
+    mutate("model" = "Adj. light")
+
+Cox_overview_6
+
+
+#Combine the 3 ESKD models into a single table
+Cox_overview_ESKD <- Cox_overview_4 %>% 
+    rbind(., Cox_overview_5, Cox_overview_6) %>% 
+    mutate("outcome" = "ESKD")
+
+rm(Cox_overview_4, Cox_overview_5, Cox_overview_6, surv_object)                                              
+```
+
+```{r Cox regression mortality with adjustments}
+#Survival object
+surv_object <- Surv(data_scale$t_doed_profil , as.numeric(as.character(data_scale$doed_profil)))
+
+## 7) Mortality - Crude model
+#Use Cox_extract function across data that starts with Target or Ratio, pivot into a table
+Cox_overview_7 <- data_scale %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(Data = data_scale, Formula = surv_object ~ .))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>% 
+    mutate("model" = "Crude")
+
+Cox_overview_7
+
+
+## 8) ESKD - Adjusted model
+Cox_overview_8 <- data_scale %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(data_scale, Formula = surv_object ~ . 
+                      + Age 
+                      + BMI 
+                      + Blood_LDL 
+                      + Blood_TGA 
+                      + CALSBP 
+                      + Gender 
+                      + GFRepi 
+                      + HbA1C_mmol_mol 
+                      + logUAER 
+                      + Previous_CVD 
+                      + Smoking 
+                      + Statin))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>% 
+    mutate("model" = "Adjusted")
+
+Cox_overview_8
+
+
+## 9) ESKD - Adjusted light model
+Cox_overview_9 <- data_scale %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(data_scale, Formula = surv_object ~ . 
+                      + Age 
+                      + BMI 
+                      + Blood_LDL 
+                      + Blood_TGA 
+                      + CALSBP 
+                      + Gender 
+                      + HbA1C_mmol_mol 
+                      + Previous_CVD 
+                      + Smoking 
+                      + Statin))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>% 
+    mutate("model" = "Adj. light")
+
+Cox_overview_9
+
+#Combine the 3 mortality models into a single table
+Cox_overview_Mortality <- Cox_overview_7 %>% 
+    rbind(., Cox_overview_8, Cox_overview_9) %>% 
+    mutate("outcome" = "Mortality")
+
+
+rm(Cox_overview_7, Cox_overview_8, Cox_overview_9, surv_object)                                                            
+```
+
+```{r Cox regression visualization - Forest plot}
+#Combine the 3 outcome tables into a single table
+Cox_overview <- Cox_overview_CVE %>% 
+    rbind(., Cox_overview_ESKD, Cox_overview_Mortality)
+
+rm(Cox_overview_CVE, Cox_overview_ESKD, Cox_overview_Mortality)
+
+#Plot overview table as a Forest Plot
+Cox_overview %>%
+    mutate(name = gsub("Target_", "Cer ", name)) %>%
+    mutate(name = gsub("Ratio_", "Ratio Cer ", name)) %>%
+    mutate(name = gsub("_", ":", name)) %>%
+    mutate(name = factor(name, levels = rev(unique(name)))) %>%
+    mutate(model = factor(model, levels = c("Crude", "Adj. light", "Adjusted"),
+                          labels = c("Crude",
+                                     "Level 1 Adjusted",
+                                     "Level 2 Adjusted"))) %>%
+    mutate(outcome = factor(outcome, levels = c("CVE", "ESKD", "Mortality"),
+                        labels = c("Cardiovascular Events", 
+                                   "Kidney Disease",
+                                   "All-Cause Mortality"))) %>% 
+    mutate(Significance = if_else(pval < 0.05, "p < 0.05", "None")) %>% 
+    mutate(Significance = if_else(pval < 0.001, "p < 0.001", Significance)) %>%
+    mutate(Significance = factor(Significance, levels = c("None", "p < 0.05", "p < 0.001"))) %>% 
+    ggplot(aes(x = coeff, y = name, color = Significance)) +
+        geom_errorbar(aes(xmin = conf_low, xmax = conf_up), width = 0.5, size = 0.8) +
+        geom_pointrange(aes(xmin = conf_low, xmax = conf_up)) +
+        geom_vline(xintercept = 1, linetype = "dashed") +
+        scale_x_log10() +
+        scale_color_manual(values = c("black", "#D9B54A", "#8C2336")) +
+        facet_grid(outcome ~ model) +
+        xlab(label = "Hazard Ratio") +
+        theme_bw() +
+        theme(axis.title.y = element_blank(),
+              legend.position = "top",
+              strip.background = element_rect(colour="black",
+                                        fill="#F2EFE9"))
+
+#export at 8x8
+
+#Correct naming in Cox_overview
+# #Cox_overview <- Cox_overview %>% 
+#     mutate(model = gsub("Adjusted", "Level 2 Adjusted", model)) %>% 
+#     mutate(model = gsub("Adj. light", "Level 1 Adjusted", model)) %>% 
+#     mutate(name = gsub("Target_", "Cer", name)) %>% 
+#     mutate(name = gsub("Ratio_", "Ratio Cer", name)) %>% 
+#     mutate(name = gsub("/24", "/Cer24", name)) %>% 
+#     mutate(name = gsub("_", ":", name)) %>% 
+#     select(-"expl_var")
+#write supplementary table
+#write.csv(Cox_overview, here("data/Cox_overview.csv"))
+
+
+# #Plot single model as a Forest Plot
+# Cox_overview %>%
+#     mutate(name = gsub("Target_", "Cer ", name)) %>%
+#     mutate(name = gsub("Ratio_", "Ratio Cer ", name)) %>%
+#     mutate(name = gsub("_", ":", name)) %>%
+#     #arrange(value$pval) %>%
+#     mutate(name = factor(name, levels = rev(unique(name)))) %>%
+#     filter(model == "Adj. light") %>% 
+#     filter(outcome == "ESKD") %>% 
+#     ggplot(aes(x = coeff, y = name)) +
+#         geom_errorbar(aes(xmin = conf_low, xmax = conf_up), width = 0.5, size = 0.8) +
+#         geom_pointrange(aes(xmin = conf_low, xmax = conf_up)) +
+#         geom_vline(xintercept = 1, linetype = "dashed") +
+#         scale_x_log10() +
+#         xlab(label = "Hazard Ratio") +
+#         theme_bw() +
+#         theme(axis.title.y = element_blank())
+
+```
+
+```{r Cox regression clinical variables + cardiovascular events}
+#Survival object - Cardiovascular events
+surv_object <- Surv(data$t_cv_komb_profil, as.numeric(as.character(data$cv_komb_profil)))
+
+#Vector of clinical factors to investigate
+clin_num <- c("Age", "BMI", "Blood_LDL", "Blood_TGA", "CALSBP", "GFRepi", "HbA1C_mmol_mol", "logUAER")
+
+clin_fac <- c("Gender", "Previous_CVD", "Smoking", "Statin")
+
+
+## 10) CVE - Clinical Crude model
+#Create an empty dataframe to populate
+Cox_clinical_overview <- data.frame("expl_var" = NA, "coeff" = NA, 
+                                    "conf_low" = NA, "conf_up" = NA, "pval"= NA)
+
+#Iterate over numeric clinical variables
+for(i in 1:length(clin_num)){
+    
+    #Run Cox model, extract the results, save into data frame 
+    Cox_clinical_overview[i,] <- 
+        Cox_extract(Data = data, Formula = paste0("surv_object ~ ", clin_num[i]))
+
+}
+
+#Iterate over factorized clinical variables 
+for(j in 1:length(clin_fac)){
+    
+    #Run Cox model, extract the results, save into data frame
+    Cox_clinical_tmp <- 
+        summary(coxph(formula = as.formula(paste0("surv_object ~ ", clin_fac[j])), data = data))
+    
+    Cox_clinical_overview[length(clin_num)+j, "expl_var"] <- 
+        rownames(Cox_clinical_tmp$conf.int)
+    Cox_clinical_overview[length(clin_num)+j, "coeff"]    <-
+        Cox_clinical_tmp$conf.int[1, "exp(coef)"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_low"] <-
+        Cox_clinical_tmp$conf.int[1, "lower .95"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_up"]  <-
+        Cox_clinical_tmp$conf.int[1, "upper .95"]
+    Cox_clinical_overview[length(clin_num)+j, "pval"]    <-
+        Cox_clinical_tmp$coefficients[1, "Pr(>|z|)"]
+
+}
+
+#Insert names of clinical variables
+Cox_clinical_overview$"name" <- c(clin_num, clin_fac)
+Cox_clinical_overview <- Cox_clinical_overview[, c(6, 1:5)]
+
+#FDR
+Cox_clinical_overview$fdr <- p.adjust(Cox_clinical_overview$pval, method = "fdr")
+
+#Model
+Cox_clinical_overview$model <- "Crude"
+
+#Rename data frame
+Cox_clinical_overview_10 <- Cox_clinical_overview
+
+
+## 11) CVE - Clinical adjusted model
+#Create an empty dataframe to populate
+Cox_clinical_overview <- data.frame("expl_var" = NA, "coeff" = NA, 
+                                    "conf_low" = NA, "conf_up" = NA, "pval"= NA)
+
+#Iterate over numeric clinical variables
+for(i in 1:length(clin_num)){
+    
+    #String of adjustments
+    clin_tmp <- c(clin_num, clin_fac)
+    clin_tmp <- clin_tmp[!clin_tmp %in% c(clin_num[i])]
+    clin_tmp <- paste(clin_tmp, collapse = " + ")
+    
+    #Run Cox model, extract the results, save into data frame 
+    Cox_clinical_overview[i,] <- 
+        Cox_extract(Data = data, 
+                    Formula = paste0("surv_object ~ ", clin_num[i], " + ", clin_tmp))
+
+}
+
+#Iterate over factorized clinical variables 
+for(j in 1:length(clin_fac)){
+    
+    #String of adjustments
+    clin_tmp <- c(clin_num, clin_fac)
+    clin_tmp <- clin_tmp[!clin_tmp %in% c(clin_fac[j])]
+    clin_tmp <- paste(clin_tmp, collapse = " + ")
+
+    #Run Cox model 
+    Cox_clinical_tmp <- 
+        summary(coxph(data = data,
+                      formula = as.formula(paste0("surv_object ~ ", clin_fac[j], " + ", clin_tmp)), ))
+    
+    #Extract the results and save into data frame
+    Cox_clinical_overview[length(clin_num)+j, "expl_var"] <- 
+        rownames(Cox_clinical_tmp$conf.int)[1]
+    Cox_clinical_overview[length(clin_num)+j, "coeff"]    <-
+        Cox_clinical_tmp$conf.int[1, "exp(coef)"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_low"] <-
+        Cox_clinical_tmp$conf.int[1, "lower .95"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_up"]  <-
+        Cox_clinical_tmp$conf.int[1, "upper .95"]
+    Cox_clinical_overview[length(clin_num)+j, "pval"]    <-
+        Cox_clinical_tmp$coefficients[1, "Pr(>|z|)"]
+
+}
+
+#Insert names of clinical variables
+Cox_clinical_overview$"name" <- c(clin_num, clin_fac)
+Cox_clinical_overview <- Cox_clinical_overview[, c(6, 1:5)]
+
+#FDR
+Cox_clinical_overview$fdr <- p.adjust(Cox_clinical_overview$pval, method = "fdr")
+
+#Model
+Cox_clinical_overview$model <- "Adjusted"
+
+#Rename data frame
+Cox_clinical_overview_11 <- Cox_clinical_overview
+
+
+
+#Combine the 2 CVE models into a single table
+Cox_clinical_overview_CVE <- Cox_clinical_overview_10 %>% 
+    rbind(., Cox_clinical_overview_11) %>% 
+    mutate("outcome" = "CVE")
+
+#Remove temporary objects
+rm(Cox_clinical_overview, Cox_clinical_overview_10, Cox_clinical_overview_11,
+   Cox_clinical_tmp, clin_fac, clin_num, clin_tmp, i, j, surv_object)
+
+```
+
+```{r Cox regression clinical variables + Kidney disease}
+#Survival object - kidney disease
+surv_object <- Surv(data$t_ESRD_profil, as.numeric(as.character(data$ESRD_profil)))
+
+#Vector of clinical factors to investigate
+clin_num <- c("Age", "BMI", "Blood_LDL", "Blood_TGA", "CALSBP", "GFRepi", "HbA1C_mmol_mol", "logUAER")
+
+clin_fac <- c("Gender", "Previous_CVD", "Smoking", "Statin")
+
+
+## 12) ESKD - Clinical Crude model
+#Create an empty dataframe to populate
+Cox_clinical_overview <- data.frame("expl_var" = NA, "coeff" = NA, 
+                                    "conf_low" = NA, "conf_up" = NA, "pval"= NA)
+
+#Iterate over numeric clinical variables
+for(i in 1:length(clin_num)){
+    
+    #Run Cox model, extract the results, save into data frame 
+    Cox_clinical_overview[i,] <- 
+        Cox_extract(Data = data, Formula = paste0("surv_object ~ ", clin_num[i]))
+
+}
+
+#Iterate over factorized clinical variables 
+for(j in 1:length(clin_fac)){
+    
+    #Run Cox model, extract the results, save into data frame
+    Cox_clinical_tmp <- 
+        summary(coxph(formula = as.formula(paste0("surv_object ~ ", clin_fac[j])), data = data))
+    
+    Cox_clinical_overview[length(clin_num)+j, "expl_var"] <- 
+        rownames(Cox_clinical_tmp$conf.int)
+    Cox_clinical_overview[length(clin_num)+j, "coeff"]    <-
+        Cox_clinical_tmp$conf.int[1, "exp(coef)"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_low"] <-
+        Cox_clinical_tmp$conf.int[1, "lower .95"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_up"]  <-
+        Cox_clinical_tmp$conf.int[1, "upper .95"]
+    Cox_clinical_overview[length(clin_num)+j, "pval"]    <-
+        Cox_clinical_tmp$coefficients[1, "Pr(>|z|)"]
+
+}
+
+#Insert names of clinical variables
+Cox_clinical_overview$"name" <- c(clin_num, clin_fac)
+Cox_clinical_overview <- Cox_clinical_overview[, c(6, 1:5)]
+
+#FDR
+Cox_clinical_overview$fdr <- p.adjust(Cox_clinical_overview$pval, method = "fdr")
+
+#Model
+Cox_clinical_overview$model <- "Crude"
+
+#Rename data frame
+Cox_clinical_overview_12 <- Cox_clinical_overview
+
+
+## 13) ESKD - Clinical adjusted model
+#Create an empty dataframe to populate
+Cox_clinical_overview <- data.frame("expl_var" = NA, "coeff" = NA, 
+                                    "conf_low" = NA, "conf_up" = NA, "pval"= NA)
+
+#Iterate over numeric clinical variables
+for(i in 1:length(clin_num)){
+    
+    #String of adjustments
+    clin_tmp <- c(clin_num, clin_fac)
+    clin_tmp <- clin_tmp[!clin_tmp %in% c(clin_num[i])]
+    clin_tmp <- paste(clin_tmp, collapse = " + ")
+    
+    #Run Cox model, extract the results, save into data frame 
+    Cox_clinical_overview[i,] <- 
+        Cox_extract(Data = data, 
+                    Formula = paste0("surv_object ~ ", clin_num[i], " + ", clin_tmp))
+
+}
+
+#Iterate over factorized clinical variables 
+for(j in 1:length(clin_fac)){
+    
+    #String of adjustments
+    clin_tmp <- c(clin_num, clin_fac)
+    clin_tmp <- clin_tmp[!clin_tmp %in% c(clin_fac[j])]
+    clin_tmp <- paste(clin_tmp, collapse = " + ")
+
+    #Run Cox model 
+    Cox_clinical_tmp <- 
+        summary(coxph(data = data,
+                      formula = as.formula(paste0("surv_object ~ ", clin_fac[j], " + ", clin_tmp)), ))
+    
+    #Extract the results and save into data frame
+    Cox_clinical_overview[length(clin_num)+j, "expl_var"] <- 
+        rownames(Cox_clinical_tmp$conf.int)[1]
+    Cox_clinical_overview[length(clin_num)+j, "coeff"]    <-
+        Cox_clinical_tmp$conf.int[1, "exp(coef)"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_low"] <-
+        Cox_clinical_tmp$conf.int[1, "lower .95"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_up"]  <-
+        Cox_clinical_tmp$conf.int[1, "upper .95"]
+    Cox_clinical_overview[length(clin_num)+j, "pval"]    <-
+        Cox_clinical_tmp$coefficients[1, "Pr(>|z|)"]
+
+}
+
+#Insert names of clinical variables
+Cox_clinical_overview$"name" <- c(clin_num, clin_fac)
+Cox_clinical_overview <- Cox_clinical_overview[, c(6, 1:5)]
+
+#FDR
+Cox_clinical_overview$fdr <- p.adjust(Cox_clinical_overview$pval, method = "fdr")
+
+#Model
+Cox_clinical_overview$model <- "Adjusted"
+
+#Rename data frame
+Cox_clinical_overview_13 <- Cox_clinical_overview
+
+
+
+#Combine the 2 kidney models into a single table
+Cox_clinical_overview_ESKD <- Cox_clinical_overview_12 %>% 
+    rbind(., Cox_clinical_overview_13) %>% 
+    mutate("outcome" = "ESKD")
+
+#Remove temporary objects
+rm(Cox_clinical_overview, Cox_clinical_overview_12, Cox_clinical_overview_13,
+   Cox_clinical_tmp, clin_fac, clin_num, clin_tmp, i, j, surv_object)
+
+```
+
+```{r Cox regression clinical variables + Mortality}
+#Survival object - kidney disease
+surv_object <- Surv(data$t_doed_profil, as.numeric(as.character(data$doed_profil)))
+
+#Vector of clinical factors to investigate
+clin_num <- c("Age", "BMI", "Blood_LDL", "Blood_TGA", "CALSBP", "GFRepi", "HbA1C_mmol_mol", "logUAER")
+
+clin_fac <- c("Gender", "Previous_CVD", "Smoking", "Statin")
+
+
+## 14) Mortality - Clinical Crude model
+#Create an empty dataframe to populate
+Cox_clinical_overview <- data.frame("expl_var" = NA, "coeff" = NA, 
+                                    "conf_low" = NA, "conf_up" = NA, "pval"= NA)
+
+#Iterate over numeric clinical variables
+for(i in 1:length(clin_num)){
+    
+    #Run Cox model, extract the results, save into data frame 
+    Cox_clinical_overview[i,] <- 
+        Cox_extract(Data = data, Formula = paste0("surv_object ~ ", clin_num[i]))
+
+}
+
+#Iterate over factorized clinical variables 
+for(j in 1:length(clin_fac)){
+    
+    #Run Cox model, extract the results, save into data frame
+    Cox_clinical_tmp <- 
+        summary(coxph(formula = as.formula(paste0("surv_object ~ ", clin_fac[j])), data = data))
+    
+    Cox_clinical_overview[length(clin_num)+j, "expl_var"] <- 
+        rownames(Cox_clinical_tmp$conf.int)
+    Cox_clinical_overview[length(clin_num)+j, "coeff"]    <-
+        Cox_clinical_tmp$conf.int[1, "exp(coef)"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_low"] <-
+        Cox_clinical_tmp$conf.int[1, "lower .95"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_up"]  <-
+        Cox_clinical_tmp$conf.int[1, "upper .95"]
+    Cox_clinical_overview[length(clin_num)+j, "pval"]    <-
+        Cox_clinical_tmp$coefficients[1, "Pr(>|z|)"]
+
+}
+
+#Insert names of clinical variables
+Cox_clinical_overview$"name" <- c(clin_num, clin_fac)
+Cox_clinical_overview <- Cox_clinical_overview[, c(6, 1:5)]
+
+#FDR
+Cox_clinical_overview$fdr <- p.adjust(Cox_clinical_overview$pval, method = "fdr")
+
+#Model
+Cox_clinical_overview$model <- "Crude"
+
+#Rename data frame
+Cox_clinical_overview_14 <- Cox_clinical_overview
+
+
+## 15) Mortality - Clinical adjusted model
+#Create an empty dataframe to populate
+Cox_clinical_overview <- data.frame("expl_var" = NA, "coeff" = NA, 
+                                    "conf_low" = NA, "conf_up" = NA, "pval"= NA)
+
+#Iterate over numeric clinical variables
+for(i in 1:length(clin_num)){
+    
+    #String of adjustments
+    clin_tmp <- c(clin_num, clin_fac)
+    clin_tmp <- clin_tmp[!clin_tmp %in% c(clin_num[i])]
+    clin_tmp <- paste(clin_tmp, collapse = " + ")
+    
+    #Run Cox model, extract the results, save into data frame 
+    Cox_clinical_overview[i,] <- 
+        Cox_extract(Data = data, 
+                    Formula = paste0("surv_object ~ ", clin_num[i], " + ", clin_tmp))
+
+}
+
+#Iterate over factorized clinical variables 
+for(j in 1:length(clin_fac)){
+    
+    #String of adjustments
+    clin_tmp <- c(clin_num, clin_fac)
+    clin_tmp <- clin_tmp[!clin_tmp %in% c(clin_fac[j])]
+    clin_tmp <- paste(clin_tmp, collapse = " + ")
+
+    #Run Cox model 
+    Cox_clinical_tmp <- 
+        summary(coxph(data = data,
+                      formula = as.formula(paste0("surv_object ~ ", clin_fac[j], " + ", clin_tmp)), ))
+    
+    #Extract the results and save into data frame
+    Cox_clinical_overview[length(clin_num)+j, "expl_var"] <- 
+        rownames(Cox_clinical_tmp$conf.int)[1]
+    Cox_clinical_overview[length(clin_num)+j, "coeff"]    <-
+        Cox_clinical_tmp$conf.int[1, "exp(coef)"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_low"] <-
+        Cox_clinical_tmp$conf.int[1, "lower .95"]
+    Cox_clinical_overview[length(clin_num)+j, "conf_up"]  <-
+        Cox_clinical_tmp$conf.int[1, "upper .95"]
+    Cox_clinical_overview[length(clin_num)+j, "pval"]    <-
+        Cox_clinical_tmp$coefficients[1, "Pr(>|z|)"]
+
+}
+
+#Insert names of clinical variables
+Cox_clinical_overview$"name" <- c(clin_num, clin_fac)
+Cox_clinical_overview <- Cox_clinical_overview[, c(6, 1:5)]
+
+#FDR
+Cox_clinical_overview$fdr <- p.adjust(Cox_clinical_overview$pval, method = "fdr")
+
+#Model
+Cox_clinical_overview$model <- "Adjusted"
+
+#Rename data frame
+Cox_clinical_overview_15 <- Cox_clinical_overview
+
+
+
+#Combine the 2 mortality models into a single table
+Cox_clinical_overview_Mortality <- Cox_clinical_overview_14 %>% 
+    rbind(., Cox_clinical_overview_15) %>% 
+    mutate("outcome" = "Mortality")
+
+#Remove temporary objects
+rm(Cox_clinical_overview, Cox_clinical_overview_14, Cox_clinical_overview_15,
+   Cox_clinical_tmp, clin_fac, clin_num, clin_tmp, i, j, surv_object)
+
+```
+
+```{r Cox regression visualization clinical - Forest plot}
+#Combine the 3 outcome tables into a single table
+Cox_clinical_overview <- Cox_clinical_overview_CVE %>% 
+    rbind(., Cox_clinical_overview_ESKD, Cox_clinical_overview_Mortality)
+
+rm(Cox_clinical_overview_CVE, Cox_clinical_overview_ESKD, Cox_clinical_overview_Mortality)
+
+#Clean names, !!NOTE VULNERABLE TO CHANGES!!
+tmp_names <- c("Age", "BMI", "LDL", "Triglyceride","Systolic Blood Pressure",
+               "eGFR", "HbA1C", "log(UAER)", "Male", "Previous CVD", "Smoking", "Statins")
+
+Cox_clinical_overview$name <- tmp_names
+
+#Plot cox clinical overview table as a Forest Plot
+Cox_clinical_overview %>% 
+    mutate(name = factor(name, levels = rev(unique(name)))) %>%
+    mutate(model = factor(model, levels = c("Crude", "Adjusted"))) %>%
+    mutate(outcome = factor(outcome, levels = c("CVE", "ESKD", "Mortality"),
+                        labels = c("Cardiovascular Events", 
+                                   "Kidney Disease",
+                                   "All-Cause Mortality"))) %>% 
+    mutate(Significance = if_else(pval < 0.05, "p < 0.05", "None")) %>% 
+    mutate(Significance = if_else(pval < 0.001, "p < 0.001", Significance)) %>%
+    mutate(Significance = factor(Significance, levels = c("None", "p < 0.05", "p < 0.001"))) %>% 
+    ggplot(aes(x = coeff, y = name, color = Significance)) +
+        geom_errorbar(aes(xmin = conf_low, xmax = conf_up), width = 0.5, size = 0.8) +
+        geom_pointrange(aes(xmin = conf_low, xmax = conf_up)) +
+        geom_vline(xintercept = 1, linetype = "dashed") +
+        scale_x_log10() +
+        scale_color_manual(values = c("black", "#D9B54A", "#8C2336")) +
+        facet_grid(outcome ~ model) +
+        xlab(label = "Hazard Ratio") +
+        theme_bw() +
+        theme(axis.title.y = element_blank(),
+              legend.position = "top",
+              strip.background = element_rect(colour="black",
+                                        fill="#F2EFE9"))
+    
+
+
+#export at 8x8
+
+
+#write supplementary table
+#write.csv(Cox_clinical_overview, here("data/Cox_clinical_overview.csv"))
+
+rm(tmp_names)
+
+```
+
+```{r Kaplan-Meier plot - Ratio vs. LDL}
+#Ceramide Ratio and CVE 
+
+#Survival object
+surv_object <- Surv(data$t_cv_komb_profil, as.numeric(as.character(data$cv_komb_profil)))
+
+#Create binary variable for targets and ratios
+data_bin <- data %>%
+  #rename(Ratio241_240 = `Ratio 24:1/24:0`) %>%
+  rename(Ratio18_240 = `Ratio 18/24:0`) %>% 
+  mutate(across(starts_with("Target") | starts_with("Ratio"),
+    ~ ifelse(. >= quantile(.)[["75%"]], "Q3-Q4", "Q1-Q3")))
+
+#FitKaplan-Meier model
+KM_fit <- survfit(formula = surv_object ~ data_bin$Ratio18_240, data = data_bin)
+
+#Plot Model
+p1 <- ggsurvplot(
+  KM_fit,
+  data = data_bin,
+  conf.int = FALSE,
+  pval = TRUE,
+  xlab = "Time in days",
+  palette =  c("#5888A6", "#8C2336"),
+  #legend = "bottom",
+  legend.title = "Ceramide Ratio\nCer18/Cer24:0",
+  legend.labs = c("Low", "High"),
+  risk.table = TRUE)
+  #ggtheme = theme_bw())
+
+p1
+
+p1t <- p1$table + labs(x = "", y = "")
+
+
+## LDL and CVE
+
+#Create binary variable for targets and ratios
+data_bin <- data %>%
+  mutate(across(starts_with("Target") | starts_with("Ratio"),
+    ~ ifelse(. >= quantile(.)[["75%"]], "Q3-Q4", "Q1-Q3"))) %>% 
+  filter(!is.na(Blood_LDL)) %>%
+  mutate(Blood_LDL = ifelse(Blood_LDL >= quantile(Blood_LDL)[["75%"]], "Q3-Q4", "Q1-Q3"))
+
+#Survival object
+surv_object <- Surv(data_bin$t_cv_komb_profil, as.numeric(as.character(data_bin$cv_komb_profil)))
+
+#FitKaplan-Meier model
+KM_fit <- survfit(formula = surv_object ~ data_bin$Blood_LDL, data = data_bin)
+
+#Plot Model
+p2 <- ggsurvplot(
+  KM_fit,
+  data = data_bin,
+  conf.int = FALSE,
+  pval = TRUE,
+  xlab = "Time in days",
+  palette =  c("#D9B54A", "#A6763C"),
+  #legend = "bottom",
+  legend.title = "LDL",
+  legend.labs = c("Low", "High"),
+  risk.table = TRUE)
+  #ggtheme = theme_bw())
+
+p2
+
+p2$plot <- p2$plot + labs(y = "")
+
+p2t <- p2$table + labs(x = "", y = "", title = "")
+
+
+## Join plots together
+ggarrange(p1$plot, p2$plot, p1t, p2t,
+          #labels = c("A", "B"),
+          heights = c(1.5, 0.5),
+          align = "v",
+          ncol = 2, nrow = 2)
+
+#Export ratio 5x10
+
+rm(surv_object, data_bin, KM_fit, p1, p1t, p2, p2t)
+```
+
+```{r Correlations matrix plot}
+library(ggcorrplot)
+library(Hmisc)
+
+#prepare data frame
+tmp_cor <- data %>% 
+    select_if(., is.numeric) %>%
+    select(!contains("censor")) %>%
+    select(!contains("retino")) %>%
+    select(-c(Height, Weight, t_komb_nyre_endepunkt_p, t_alb_prog, t_gfrfald30_p, CB)) %>% 
+    #select(-c(hsCRP, Cal_DIA, CB,)) %>% 
+    #select(-c(Target_20, Target_22, Target_24_1,
+    #          `Ratio 16/24:0`, `Ratio 18/24:0`, `Ratio 20/24:0`, `Ratio 22/24:0`)) %>% 
+    rename_with( ~gsub("Target_", "Cer_", .)) %>%
+    rename_with( ~gsub(" ", "_", .)) %>%
+    rename_with( ~gsub(":", "_", .)) %>%
+    rename_with( ~gsub("/", "_", .)) %>%
+    mutate(across(everything(), ~ if_else(is.na(.x), median(., na.rm = TRUE), .)))
+
+#Calculate correlation matrix
+tmp_cor <- rcorr(as.matrix(tmp_cor), type = "pearson")
+
+#extract correlation coeffiecints and p-values
+tmp1 <- tmp_cor$r
+
+#set NA p-values to 0
+tmp_cor$P[is.na(tmp_cor$P)] <- 0
+tmp2 <- tmp_cor$P
+
+#Clean names, !!NOTE VULNERABLE TO CHANGES!!
+tmp_names <- c("Cer16", "Cer18", "Cer20", "Cer22", "Cer24:0", "Cer24:1",
+               "Ratio Cer16/Cer24:0", "Ratio Cer18/Cer24:0", "Ratio Cer20/Cer24:0", 
+               "Ratio Cer22/Cer24:0", "Ratio Cer24:1/Cer24:0", "Age", 
+               "Diabetes Duration", "BMI", "log(UAER)",
+               "HbA1C", "Hemoglobin", "Cholesterol", "HDL", "LDL", "VLDL", "Creatinine",
+               "Triglyceride", "eGFR", "hsCRP", "Systolic Blood Pressure",
+               "Diastolic Blood Pressure", "Insulin Dose", "Mortality",
+               "CVE", "ESRD")
+
+colnames(tmp1) <- rownames(tmp1) <- rownames(tmp2) <- colnames(tmp2) <- tmp_names
+
+
+#plot
+ggcorrplot(tmp1,
+           hc.order = FALSE, 
+           outline.col = "#F2EFE9",
+           p.mat = tmp2,
+           sig.level = 0.05,
+           insig = "blank",
+           lab = TRUE,
+           ggtheme = ggplot2::theme_minimal,
+           colors = c("#5888A6", "white", "#8C2336"))
+
+#export size 15x15
+
+
+
+#Subset plot for of Cer18/cer24:0 and CVD confounders only
+subset_vars <- c("Age", 
+               "Diabetes Duration", "BMI", "log(UAER)",
+               "HbA1C", "LDL",  "Triglyceride", "eGFR", 
+               "Systolic Blood Pressure")
+
+tmp3 <- tmp1[subset_vars, grepl("Cer", colnames(tmp1))]
+tmp3 <- tmp3[,rev(colnames(tmp3))]
+
+tmp4 <- tmp2[subset_vars, grepl("Cer", colnames(tmp2))]
+tmp4 <- tmp4[,rev(colnames(tmp4))]
+
+#Ceramides vs. CVD confounders
+ggcorrplot(tmp3,
+           p.mat = tmp4, insig = "blank",
+           colors = c("#5888A6", "white", "#8C2336"))
+
+# #export size 6x6
+
+# #Ratio Cer18/Cer24:0 vs confounder
+# tmp3 <- as.data.frame(tmp1[subset_vars, "Ratio Cer18/Cer24:0"])
+# colnames(tmp3) <- "Ratio Cer18/Cer24:0"
+# 
+# ggcorrplot(tmp3, method = "circle",
+#            colors = c("#5888A6", "white", "#8C2336"))
+
+#export size 6x6
+
+rm(tmp_cor, tmp1, tmp2, tmp3, tmp4, subset_vars, tmp_names)
+```
+
+```{r Cox Regression for CVE faceted by albuminuria}
+## Normoalbuminuria - n = 308
+
+#Subset normoalbuminuria group
+data_scale_norm <- data_scale %>% 
+    filter(Albuminuri_3_groups == 1)
+
+#Survival object
+surv_object <- Surv(data_scale_norm$t_cv_komb_profil, as.numeric(as.character(data_scale_norm$cv_komb_profil)))
+
+## 16) CVE - Crude model Normoalbuminuria
+#Use Cox_extract function across data that starts with Target or Ratio, pivot into a table
+Cox_overview_norm <- data_scale_norm %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(Data = data_scale_norm, Formula = surv_object ~ .))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>% 
+    mutate("model" = "Normoalbuminuria")
+
+Cox_overview_norm
+rm(data_scale_norm)
+
+## Microalbuminuria - n = 165
+
+#Subset Microalbuminuria group
+data_scale_micro <- data_scale %>% 
+    filter(Albuminuri_3_groups == 3)
+
+#Survival object
+surv_object <- Surv(data_scale_micro$t_cv_komb_profil, as.numeric(as.character(data_scale_micro$cv_komb_profil)))
+
+## 17) CVE - Crude model Microalbuminuria
+#Use Cox_extract function across data that starts with Target or Ratio, pivot into a table
+Cox_overview_micro <- data_scale_micro %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(Data = data_scale_micro, Formula = surv_object ~ .))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>% 
+    mutate("model" = "Microalbuminuria")
+
+Cox_overview_micro
+rm(data_scale_micro)
+
+## Macroalbuminuria - n = 189
+
+#Subset Microalbuminuria group
+data_scale_macro <- data_scale %>% 
+    filter(Albuminuri_3_groups == 4)
+
+#Survival object
+surv_object <- Surv(data_scale_macro$t_cv_komb_profil, as.numeric(as.character(data_scale_macro$cv_komb_profil)))
+
+## 18) CVE - Crude model Macroalbuminuria
+#Use Cox_extract function across data that starts with Target or Ratio, pivot into a table
+Cox_overview_macro <- data_scale_macro %>%
+    rename_with(~gsub("Ratio ", "Ratio_", .), starts_with("Ratio")) %>% 
+    summarise(across(starts_with("Target") | starts_with("Ratio"),
+        ~ Cox_extract(Data = data_scale_macro, Formula = surv_object ~ .))) %>% 
+    pivot_longer(cols = everything()) %>%
+    unnest(cols = everything()) %>% 
+    mutate("fdr" = p.adjust(pval, method = "fdr")) %>% 
+    mutate("model" = "Macroalbuminuria")
+
+Cox_overview_macro
+rm(data_scale_macro)
+
+
+#Combine the 3 albuminuria groups into a single table
+Cox_overview_albuminuria <- Cox_overview_norm %>% 
+    rbind(., Cox_overview_micro, Cox_overview_macro)
+
+rm(Cox_overview_norm, Cox_overview_micro, Cox_overview_macro)
+
+#Plot overview table as a Forest Plot
+Cox_overview_albuminuria %>%
+    mutate(name = gsub("Target_", "Cer ", name)) %>%
+    mutate(name = gsub("Ratio_", "Ratio Cer ", name)) %>%
+    mutate(name = gsub("_", ":", name)) %>%
+    mutate(name = factor(name, levels = rev(unique(name)))) %>%
+    mutate(model = factor(model, levels = c("Normoalbuminuria", 
+                                            "Microalbuminuria", 
+                                            "Macroalbuminuria"))) %>%
+    # mutate(outcome = factor(outcome, levels = c("CVE", "ESKD", "Mortality"),
+    #                     labels = c("Cardiovascular Events", 
+    #                                "Kidney Disease",
+    #                                "All-Cause Mortality"))) %>% 
+    mutate(Significance = if_else(pval < 0.05, "p < 0.05", "None")) %>% 
+    mutate(Significance = if_else(pval < 0.001, "p < 0.001", Significance)) %>%
+    mutate(Significance = factor(Significance, levels = c("None", "p < 0.05", "p < 0.001"))) %>% 
+    ggplot(aes(x = coeff, y = name, color = Significance)) +
+        geom_errorbar(aes(xmin = conf_low, xmax = conf_up), width = 0.5, size = 0.8) +
+        geom_pointrange(aes(xmin = conf_low, xmax = conf_up)) +
+        geom_vline(xintercept = 1, linetype = "dashed") +
+        scale_x_log10() +
+        scale_color_manual(values = c("black", "#D9B54A", "#8C2336")) +
+        facet_grid( ~ model) +
+        xlab(label = "CVE Hazard Ratio") +
+        theme_bw() +
+        theme(axis.title.y = element_blank(),
+              legend.position = "top",
+              strip.background = element_rect(colour="black",
+                                        fill="#F2EFE9"))
+
+#export at 3x6
+
+#write supplementary table
+#write.csv(Cox_overview_albuminuria, here("data/Cox_overview_albuminuria.csv"))
+
+
+```
+
+```{r Boxplot total and albu groups}
+#Scatterplot UAER and egfr
+data %>% 
+    select(Target_18, Target_24_0, `Ratio 18/24:0`, 
+           Albuminuri_3_groups, cv_komb_profil) %>%
+    mutate(Albuminuri_3_groups = factor(Albuminuri_3_groups, 
+                                        labels = c("Normoalbuminuria", 
+                                                   "Microalbuminuria", 
+                                                   "Macroalbuminuria"))) %>% 
+    mutate(cv_komb_profil = factor(cv_komb_profil,
+                                   labels = c("No CVE", "CVE"))) %>% 
+    pivot_longer(cols = starts_with("Target") | starts_with("Ratio"),
+                 names_to = "Cer_Name", values_to = "Cer_val") %>% 
+    mutate(Cer_Name = gsub("Target_", "Cer", Cer_Name)) %>% 
+    mutate(Cer_Name = gsub("/24", "/Cer24", Cer_Name)) %>%
+    mutate(Cer_Name = gsub("_", ":", Cer_Name)) %>%
+    mutate(Cer_Name = gsub("Ratio ", "Ratio Cer", Cer_Name)) %>%
+    ggplot(aes(x = cv_komb_profil, y = Cer_val , fill = cv_komb_profil)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(position = position_jitter(0.3),
+                alpha = 0.2) +
+    scale_fill_manual(values = c("#D9B54A", "#8C2336"))+
+    facet_grid(Cer_Name ~ Albuminuri_3_groups, scales = "free")+
+    ylab("Ceramide Level")+
+    theme_bw()+
+    theme(axis.title.x=element_blank(),
+          legend.position="none",
+          strip.background = element_rect(colour="black",
+                                        fill="#F2EFE9"))
+
+#export as 7x7
+
+```
+
