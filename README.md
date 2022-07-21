@@ -10,7 +10,7 @@ The following folders contain:
 
 - `data-raw/`: This project involves personal data, which is availble with the right legal permission, thus the folder is empty
 - `data/`: This folder contains outputted tables
-- `R/`: The script used for data processing and the script used for the data analysis 
+- `R/`: This folder have the script used for data processing and the script used for the data analysis, aswell as their markdown documentation.
 
 
 # Resource
