@@ -1,30 +1,17 @@
-TODO: Add more to the title of your project here
 
-# Profil_4cer_Data_Analysis:
+# Profil Ceramide Data Analysis:
 
-Investigate the ceramides Cer(16:0), Cer(18:0), Cer(24:0), Cer(24:1)
-for their association to cardiovascular dissease in the Profil trial.
+This project set out to investigate the ceramides Cer(16:0), Cer(18:0), Cer(20:0), Cer(22:0) Cer(24:0), Cer(24:1)
+for their association to cardiovascular dissease in the Profil trial. 
 
 # Brief description of folder and file contents
 
-TODO: As project evolves, add brief description of what is inside the data, doc and R folders.
-
 The following folders contain:
 
-- `data/`:
-- `doc/`:
-- `R/`:
+- `data-raw/`: This project involves personal data, which is availble with the right legal permission, thus the folder is empty
+- `data/`: This folder contains outputted tables
+- `R/`: The script used for data processing and the script used for the data analysis 
 
-# Installing project R package dependencies
-
-If dependencies have been managed by using `usethis::use_package("packagename")`
-through the `DESCRIPTION` file, installing dependencies is as easy as opening the
-`Profil_4cer_Data_Analysis.Rproj` file and running this command in the console:
-
-    # install.packages("remotes")
-    remotes::install_deps()
-
-You'll need to have remotes installed for this to work.
 
 # Resource
 
