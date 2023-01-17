@@ -130,44 +130,17 @@ data %>%
 
 #Proxy conc.
 #ISTD concentration in each sample ends up at 2ug/ml
+#0.01ug ISTD injected
+#0.005ml injection volume
+#14 is the dilution factor
 data <- data %>% 
     mutate(across(.cols = starts_with("Target") & !contains("ISTD"),
-                  ~ ./(Target_17_ISTD*2)))
-
+                  ~ 14*(((.*0.01)/Target_17_ISTD)/0.005)))
 
 #Relative Standard deviation (RSD) of Pooled samples after proxy conc. normalization
 data %>% 
     filter(Sample_ID == "PO") %>% 
     summarise(across(starts_with("Target_"), ~ sd(.)/mean(.)*100, .names = "RSD_{.col}"))
-
-```
-
-
-```{r Normalize to ISTD}
-##NOTE Normalizing to ISTD should no be carried out if using proxy conc.
-
-# #Normalization
-# # #cer 24_1 Run nr plot before normalizing to ISTD
-# # Run_nr_plot(Data = data, Target = "Target_24_1", Filter_out = "^[A-Za-z]+")
-# 
-# #Relative Standard deviation (RSD) of Pooled samples before normalization
-# data %>% 
-#     filter(Sample_ID == "PO") %>% 
-#     summarise(across(starts_with("Target_"), ~ sd(.)/mean(.)*100, .names = "RSD_{.col}"))
-# 
-# #Normalize to ISTD
-# data <- data %>% 
-#     mutate(across(starts_with("Target") & !contains("ISTD"),  
-#                   ~ ./Target_17_ISTD))
-# 
-# # #cer 24_1 Run nr plot before normalizing to ISTD
-# # Run_nr_plot(Data = data, Target = "Target_24_1", Filter_out = "^[A-Za-z]+")
-# 
-# #Relative Standard deviation (RSD) of Pooled samples after normalization
-# data %>% 
-#     filter(Sample_ID == "PO") %>% 
-#     summarise(across(starts_with("Target_"), ~ sd(.)/mean(.)*100, .names = "RSD_{.col}"))
-# 
 
 ```
 
@@ -310,4 +283,3 @@ rm(data_clinical)
 vroom::vroom_write(data, here::here("data/0033_profil_4cer_data_preprocessed.csv"))
 
 ```
-

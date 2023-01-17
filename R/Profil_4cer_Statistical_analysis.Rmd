@@ -15,6 +15,7 @@ library(vroom)
 library(tableone)
 library(survival)
 library(survminer)
+library(ggpubr)
 
 #Color palette based on Wassily Kandinsky´s On White II
 Kandinsky_OW2 <- c(Red    = "#8C2336", 
@@ -36,7 +37,8 @@ data <- data %>%
     tmp <- unique(x)
     length(tmp) - sum(is.na(tmp)) == 2L})),
   ~ factor(.))) %>%
-  mutate_at(c("Sample_ID", "Albuminuri_3_groups", "Retinopathy"), ~ factor(.))
+    mutate_at(c("Sample_ID", "Albuminuri_3_groups", "Retinopathy"), ~ factor(.)) %>% 
+    mutate(Gender = factor(Gender, levels = c(1, 0), labels = c("Male", "Female")))
 
 #Split curated (Complete data with 662 observations) and 
 #full data set (721 observations but many missing values)
@@ -58,14 +60,18 @@ data <- data_curated
 CCtable_vars <- colnames(data)[which(colnames(data) == "Age"):
                                 which(colnames(data) == "Spiron")]
 
-
-
 #Clinical characteristics table, stratified by previous CV complications
 CCtable <- data %>%
-  mutate(Gender = factor(Gender,levels = c(1, 0), labels = c("Man", "Woman"))) %>%
   mutate(RAAS = factor(RAAS,levels = c(2, 1))) %>%
-  mutate(across(starts_with("Cer_"), ~.*1000)) %>%
-        CreateTableOne(vars = CCtable_vars,
+    mutate(HbA1c_percent = (HbA1C_mmol_mol/10.929)+2.15) %>% 
+    mutate(Retinopathy_v2 = if_else(Retinopathy == 0, "No", "Other")) %>%
+    mutate(Retinopathy_v2 = if_else(Retinopathy == 1 | Retinopathy == 2, 
+                                    "Mild-moderate", Retinopathy_v2)) %>%
+    mutate(Retinopathy_v2 = if_else(Retinopathy == 3, "Proliferative", Retinopathy_v2)) %>% 
+    mutate(Retinopathy = Retinopathy_v2) %>% 
+    mutate(CB = if_else(CB > 1, 1, CB)) %>%
+    mutate(CB = factor(CB)) %>% 
+        CreateTableOne(vars = c(CCtable_vars, "HbA1c_percent"),
                                 strata = "cv_komb_profil",
                                 #strata = "ESRD_profil", 
                                 #strata = "doed_profil",
@@ -83,12 +89,16 @@ data %>%
     Median_year = (median(followed)) / 365,
     IQR_year = (IQR(followed)) / 365)
 
+#UAER interquartile range
+quantile(exp(data$logUAER), na.rm = TRUE)
+quantile(exp(data$logUAER[data$cv_komb_profil == 0]), na.rm = TRUE)
+quantile(exp(data$logUAER[data$cv_komb_profil == 1]), na.rm = TRUE)
 
 rm(CCtable, CCtable_vars)
 ```
 
 ```{r Ceramide Table}
-#Note: measures are changed from ug/mol to ng/mol
+#Note: measures are changed from ug/ml to ng/ml
 #Table of mean, startified by CVE
 CerTable_CVE <- data %>%
     select(c(starts_with("Target"), starts_with("Ratio"), cv_komb_profil)) %>% 
@@ -383,7 +393,7 @@ Cox_overview <- Cox_overview_CVE %>%
 rm(Cox_overview_CVE, Cox_overview_ESKD, Cox_overview_Mortality)
 
 #Plot overview table as a Forest Plot
-Cox_overview %>%
+Fig1_forest_plot <- Cox_overview %>%
     mutate(name = gsub("Target_", "Cer ", name)) %>%
     mutate(name = gsub("Ratio_", "Ratio Cer ", name)) %>%
     mutate(name = gsub("_", ":", name)) %>%
@@ -394,7 +404,7 @@ Cox_overview %>%
                                      "Level 2 Adjusted"))) %>%
     mutate(outcome = factor(outcome, levels = c("CVE", "ESKD", "Mortality"),
                         labels = c("Cardiovascular Events", 
-                                   "Kidney Disease",
+                                   "Kidney Failure",
                                    "All-Cause Mortality"))) %>% 
     mutate(Significance = if_else(pval < 0.05, "p < 0.05", "None")) %>% 
     mutate(Significance = if_else(pval < 0.001, "p < 0.001", Significance)) %>%
@@ -412,18 +422,26 @@ Cox_overview %>%
               legend.position = "top",
               strip.background = element_rect(colour="black",
                                         fill="#F2EFE9"))
+#Legend text
+Fig1_legend_text <- ggparagraph(text = paste("Figure 1 – Forest plot of hazard ratios for ceramide and ratios for outcomes of cardiovascular events, kidney failure and mortality. The crude models are unadjusted, level 1 adjusted for age, sex, BMI, LDL, triglycerides, systolic blood pressure, HbA1C, history of CVD, smoking status and statin use. Level 2 adjusted for all the same variables as level 1, but also included eGFR and UAER. Hazard ratios (HRs) are reported per doubling of the log10 ceramide"), size = 10)
 
-#export at 8x8
+ggarrange(Fig1_forest_plot, Fig1_legend_text, 
+          ncol = 1,
+          heights = c(1, 0.2))
+
+
+
+#export at 8x7.1 inches with legend (7.1x7.1 without)
 
 #Correct naming in Cox_overview
-# #Cox_overview <- Cox_overview %>% 
-#     mutate(model = gsub("Adjusted", "Level 2 Adjusted", model)) %>% 
-#     mutate(model = gsub("Adj. light", "Level 1 Adjusted", model)) %>% 
-#     mutate(name = gsub("Target_", "Cer", name)) %>% 
-#     mutate(name = gsub("Ratio_", "Ratio Cer", name)) %>% 
-#     mutate(name = gsub("/24", "/Cer24", name)) %>% 
-#     mutate(name = gsub("_", ":", name)) %>% 
-#     select(-"expl_var")
+Cox_overview <- Cox_overview %>%
+    mutate(model = gsub("Adjusted", "Level 2 Adjusted", model)) %>%
+    mutate(model = gsub("Adj. light", "Level 1 Adjusted", model)) %>%
+    mutate(name = gsub("Target_", "Cer", name)) %>%
+    mutate(name = gsub("Ratio_", "Ratio Cer", name)) %>%
+    mutate(name = gsub("/24", "/Cer24", name)) %>%
+    mutate(name = gsub("_", ":", name)) %>%
+    select(-"expl_var")
 #write supplementary table
 #write.csv(Cox_overview, here("data/Cox_overview.csv"))
 
@@ -446,6 +464,7 @@ Cox_overview %>%
 #         theme_bw() +
 #         theme(axis.title.y = element_blank())
 
+rm(Fig1_forest_plot, Fig1_legend_text)
 ```
 
 ```{r Cox regression clinical variables + cardiovascular events}
@@ -850,7 +869,7 @@ rm(Cox_clinical_overview_CVE, Cox_clinical_overview_ESKD, Cox_clinical_overview_
 
 #Clean names, !!NOTE VULNERABLE TO CHANGES!!
 tmp_names <- c("Age", "BMI", "LDL", "Triglyceride","Systolic Blood Pressure",
-               "eGFR", "HbA1C", "log(UAER)", "Male", "Previous CVD", "Smoking", "Statins")
+               "eGFR", "HbA1C", "log(UAER)", "Female", "Previous CVD", "Smoking", "Statins")
 
 Cox_clinical_overview$name <- tmp_names
 
@@ -860,7 +879,7 @@ Cox_clinical_overview %>%
     mutate(model = factor(model, levels = c("Crude", "Adjusted"))) %>%
     mutate(outcome = factor(outcome, levels = c("CVE", "ESKD", "Mortality"),
                         labels = c("Cardiovascular Events", 
-                                   "Kidney Disease",
+                                   "Kidney Failure",
                                    "All-Cause Mortality"))) %>% 
     mutate(Significance = if_else(pval < 0.05, "p < 0.05", "None")) %>% 
     mutate(Significance = if_else(pval < 0.001, "p < 0.001", Significance)) %>%
@@ -879,8 +898,6 @@ Cox_clinical_overview %>%
               strip.background = element_rect(colour="black",
                                         fill="#F2EFE9"))
     
-
-
 #export at 8x8
 
 
@@ -895,14 +912,14 @@ rm(tmp_names)
 #Ceramide Ratio and CVE 
 
 #Survival object
-surv_object <- Surv(data$t_cv_komb_profil, as.numeric(as.character(data$cv_komb_profil)))
+surv_object <- Surv((data$t_cv_komb_profil)/365, as.numeric(as.character(data$cv_komb_profil)))
 
 #Create binary variable for targets and ratios
 data_bin <- data %>%
   #rename(Ratio241_240 = `Ratio 24:1/24:0`) %>%
   rename(Ratio18_240 = `Ratio 18/24:0`) %>% 
   mutate(across(starts_with("Target") | starts_with("Ratio"),
-    ~ ifelse(. >= quantile(.)[["75%"]], "Q3-Q4", "Q1-Q3")))
+    ~ ifelse(. >= quantile(.)[["50%"]], "Above median", "Below median")))
 
 #FitKaplan-Meier model
 KM_fit <- survfit(formula = surv_object ~ data_bin$Ratio18_240, data = data_bin)
@@ -913,7 +930,8 @@ p1 <- ggsurvplot(
   data = data_bin,
   conf.int = FALSE,
   pval = TRUE,
-  xlab = "Time in days",
+  xlab = "Years",
+  ylab = "CVE rate",
   palette =  c("#5888A6", "#8C2336"),
   #legend = "bottom",
   legend.title = "Ceramide Ratio\nCer18/Cer24:0",
@@ -931,12 +949,12 @@ p1t <- p1$table + labs(x = "", y = "")
 #Create binary variable for targets and ratios
 data_bin <- data %>%
   mutate(across(starts_with("Target") | starts_with("Ratio"),
-    ~ ifelse(. >= quantile(.)[["75%"]], "Q3-Q4", "Q1-Q3"))) %>% 
+    ~ ifelse(. >= quantile(.)[["50%"]], "Above median", "Below median"))) %>% 
   filter(!is.na(Blood_LDL)) %>%
-  mutate(Blood_LDL = ifelse(Blood_LDL >= quantile(Blood_LDL)[["75%"]], "Q3-Q4", "Q1-Q3"))
+  mutate(Blood_LDL = ifelse(Blood_LDL >= quantile(Blood_LDL)[["50%"]], "Above median", "Below median"))
 
 #Survival object
-surv_object <- Surv(data_bin$t_cv_komb_profil, as.numeric(as.character(data_bin$cv_komb_profil)))
+surv_object <- Surv((data_bin$t_cv_komb_profil)/365, as.numeric(as.character(data_bin$cv_komb_profil)))
 
 #FitKaplan-Meier model
 KM_fit <- survfit(formula = surv_object ~ data_bin$Blood_LDL, data = data_bin)
@@ -947,7 +965,7 @@ p2 <- ggsurvplot(
   data = data_bin,
   conf.int = FALSE,
   pval = TRUE,
-  xlab = "Time in days",
+  xlab = "Years",
   palette =  c("#D9B54A", "#A6763C"),
   #legend = "bottom",
   legend.title = "LDL",
@@ -963,15 +981,30 @@ p2t <- p2$table + labs(x = "", y = "", title = "")
 
 
 ## Join plots together
-ggarrange(p1$plot, p2$plot, p1t, p2t,
-          #labels = c("A", "B"),
+Fig2_km_plots <- ggarrange(p1$plot, p2$plot, p1t, p2t,
+          labels = c("A", "B"),
           heights = c(1.5, 0.5),
           align = "v",
           ncol = 2, nrow = 2)
 
-#Export ratio 5x10
+#Legend text
+Fig2_legend_text <- ggparagraph(text = paste("Figure 2 – Kaplan Meier plot of cer18/cer24:0 ratio and LDL against CVE. High is metabolite level greater than or equal to the median, low is individuals with a metabolite level below the median."), size = 10)
 
-rm(surv_object, data_bin, KM_fit, p1, p1t, p2, p2t)
+ggarrange(Fig2_km_plots, Fig2_legend_text, 
+          ncol = 1,
+          heights = c(1, 0.2))
+
+#Export ratio 6x10 with legend
+#Export ratio 5x10 without
+
+# #Extract Risks
+# p1$data.survplot[p1$data.survplot$Ratio18_240 == "Below median" & p1$data.survplot$time == 2212,]
+# p1$data.survplot[p1$data.survplot$Ratio18_240 == "Above median" & p1$data.survplot$time == 2212,]
+# 
+# p2$data.survplot[p2$data.survplot$Blood_LDL == "Below median" & p2$data.survplot$time == 2212,]
+# p2$data.survplot[p2$data.survplot$Blood_LDL == "Above median" & p2$data.survplot$time == 2212,]
+
+rm(surv_object, data_bin, KM_fit, p1, p1t, p2, p2t, Fig2_km_plots, Fig2_legend_text)
 ```
 
 ```{r Correlations matrix plot}
@@ -1015,7 +1048,6 @@ tmp_names <- c("Cer16", "Cer18", "Cer20", "Cer22", "Cer24:0", "Cer24:1",
 
 colnames(tmp1) <- rownames(tmp1) <- rownames(tmp2) <- colnames(tmp2) <- tmp_names
 
-
 #plot
 ggcorrplot(tmp1,
            hc.order = FALSE, 
@@ -1028,7 +1060,6 @@ ggcorrplot(tmp1,
            colors = c("#5888A6", "white", "#8C2336"))
 
 #export size 15x15
-
 
 
 #Subset plot for of Cer18/cer24:0 and CVD confounders only
@@ -1044,11 +1075,19 @@ tmp4 <- tmp2[subset_vars, grepl("Cer", colnames(tmp2))]
 tmp4 <- tmp4[,rev(colnames(tmp4))]
 
 #Ceramides vs. CVD confounders
-ggcorrplot(tmp3,
+Fig3_correlation_matrix <- ggcorrplot(tmp3,
            p.mat = tmp4, insig = "blank",
            colors = c("#5888A6", "white", "#8C2336"))
 
-# #export size 6x6
+#Legend text
+Fig3_legend_text <- ggparagraph(text = paste("Figure 3 – Heatmap of ceramides correlation to possible CVE confounders, presented as correlations coefficients from Pearson’s correlation."), size = 10)
+
+ggarrange(Fig3_correlation_matrix, Fig3_legend_text, 
+          ncol = 1,
+          heights = c(1, 0.2))
+
+#export 7.1x7.1 with legend
+#export size 6x6 without
 
 # #Ratio Cer18/Cer24:0 vs confounder
 # tmp3 <- as.data.frame(tmp1[subset_vars, "Ratio Cer18/Cer24:0"])
@@ -1059,7 +1098,7 @@ ggcorrplot(tmp3,
 
 #export size 6x6
 
-rm(tmp_cor, tmp1, tmp2, tmp3, tmp4, subset_vars, tmp_names)
+rm(tmp_cor, tmp1, tmp2, tmp3, tmp4, subset_vars, tmp_names, Fig3_correlation_matrix, Fig3_legend_text)
 ```
 
 ```{r Cox Regression for CVE faceted by albuminuria}
@@ -1140,14 +1179,18 @@ Cox_overview_albuminuria <- Cox_overview_norm %>%
 rm(Cox_overview_norm, Cox_overview_micro, Cox_overview_macro)
 
 #Plot overview table as a Forest Plot
-Cox_overview_albuminuria %>%
+Fig4_forest_plot_albuminuria <- Cox_overview_albuminuria %>%
     mutate(name = gsub("Target_", "Cer ", name)) %>%
     mutate(name = gsub("Ratio_", "Ratio Cer ", name)) %>%
     mutate(name = gsub("_", ":", name)) %>%
     mutate(name = factor(name, levels = rev(unique(name)))) %>%
-    mutate(model = factor(model, levels = c("Normoalbuminuria", 
-                                            "Microalbuminuria", 
-                                            "Macroalbuminuria"))) %>%
+    mutate(model = factor(model, 
+                          levels = c("Normoalbuminuria", 
+                                     "Microalbuminuria", 
+                                     "Macroalbuminuria"),
+                          labels = c("Normoalbuminuria", 
+                                     "Moderately Increased", 
+                                     "Severely Increased"))) %>%
     # mutate(outcome = factor(outcome, levels = c("CVE", "ESKD", "Mortality"),
     #                     labels = c("Cardiovascular Events", 
     #                                "Kidney Disease",
@@ -1169,23 +1212,33 @@ Cox_overview_albuminuria %>%
               strip.background = element_rect(colour="black",
                                         fill="#F2EFE9"))
 
-#export at 3x6
+#Legend text
+Fig4_legend_text <- ggparagraph(text = paste("Figure 4 – Forest plot of hazard ratios for ceramide and ratios for cardiovascular events separated by albuminuria status. Normoalbuminuria is defined as <30 mg/g, moderately increased is between 30-299 mg/g and severely increased is >=300 mg/g. These models are unadjusted crude models. Hazard ratios (HRs) are reported per doubling of the log10 ceramide."), size = 10)
+
+ggarrange(Fig4_forest_plot_albuminuria, Fig4_legend_text, 
+          ncol = 1,
+          heights = c(1, 0.2))
+
+
+#export at 4.5X7.1 with legend
+#export at 3x6 without
 
 #write supplementary table
 #write.csv(Cox_overview_albuminuria, here("data/Cox_overview_albuminuria.csv"))
 
-
+rm(surv_object, Cox_clinical_overview, Cox_overview, Cox_overview_albuminuria, 
+   Fig4_forest_plot_albuminuria, Fig4_legend_text)
 ```
 
 ```{r Boxplot total and albu groups}
-#Scatterplot UAER and egfr
+#Scatterplot UAER and eGFR
 data %>% 
     select(Target_18, Target_24_0, `Ratio 18/24:0`, 
            Albuminuri_3_groups, cv_komb_profil) %>%
     mutate(Albuminuri_3_groups = factor(Albuminuri_3_groups, 
-                                        labels = c("Normoalbuminuria", 
-                                                   "Microalbuminuria", 
-                                                   "Macroalbuminuria"))) %>% 
+                                        labels = c("Normoalbuminuria",
+                                                   "Moderately Increased",
+                                                   "Severely Increased"))) %>% 
     mutate(cv_komb_profil = factor(cv_komb_profil,
                                    labels = c("No CVE", "CVE"))) %>% 
     pivot_longer(cols = starts_with("Target") | starts_with("Ratio"),
@@ -1210,4 +1263,3 @@ data %>%
 #export as 7x7
 
 ```
-
